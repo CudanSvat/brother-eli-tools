@@ -53,12 +53,19 @@ export function formatAmount(row: ApprovalRow): string {
   const decimals = row.decimals ?? 18;
   try {
     const raw = BigInt(row.amount);
+    if (raw === 0n) return "0";
     const base = 10n ** BigInt(decimals);
+    // Dust: positive but under 0.0001 of the token unit
+    const dustCut = base / 10_000n; // 1e-4 in token units (0 if decimals < 4)
+    if (dustCut > 0n && raw < dustCut) return "<0.0001";
     const whole = raw / base;
     const frac = raw % base;
     if (frac === 0n) return whole.toString();
     const fracStr = frac.toString().padStart(decimals, "0").replace(/0+$/, "").slice(0, 4);
-    return fracStr ? `${whole}.${fracStr}` : whole.toString();
+    if (!fracStr) return whole.toString();
+    // e.g. 0.00004 truncated to 4 places would look like 0.0000 — still dust
+    if (whole === 0n && fracStr.replace(/0/g, "") === "") return "<0.0001";
+    return `${whole}.${fracStr}`;
   } catch {
     return row.amount;
   }

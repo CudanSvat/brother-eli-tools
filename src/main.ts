@@ -21,6 +21,8 @@ import {
 
 type Phase = "idle" | "connecting" | "scanning" | "ready" | "revoking" | "done";
 
+type ScanKind = "none" | "quick" | "deep";
+
 const state = {
   phase: "idle" as Phase,
   wallet: null as Wallet | null,
@@ -29,6 +31,8 @@ const state = {
   approvals: [] as ApprovalRow[],
   selected: new Set<string>(),
   warnings: [] as string[],
+  /** Last finished scan depth — drives empty-state + status copy. */
+  scanKind: "none" as ScanKind,
   tx: "",
   unwatch: () => {},
 };
@@ -170,9 +174,14 @@ function renderList() {
     return;
   }
   if (!state.approvals.length) {
-    const hint = state.warnings[0]
-      ? esc(state.warnings[0])
-      : "No live allowances on the quick pass. Hit Deep scan for full history, or Rescan after a revoke settles.";
+    const hint =
+      state.scanKind === "deep"
+        ? state.warnings[0]
+          ? `Deep scan finished. No live allowances — ${esc(state.warnings[0])}`
+          : "Deep scan finished. No live allowances in history or on known routers."
+        : state.scanKind === "quick"
+          ? "No live allowances on the quick pass. Hit Deep scan for full history, or Rescan after a revoke settles."
+          : "Connect and scan to list live allowances.";
     box.innerHTML = `<div class="empty"><b>Clean</b><span>${hint}</span></div>`;
     return;
   }
@@ -296,6 +305,7 @@ async function onDisconnect() {
   state.approvals = [];
   state.selected.clear();
   state.warnings = [];
+  state.scanKind = "none";
   state.tx = "";
   state.phase = "idle";
   renderAll();
@@ -305,18 +315,19 @@ async function onDisconnect() {
 function applyScanResult(res: Awaited<ReturnType<typeof fetchApprovals>>, deep: boolean) {
   state.approvals = res.approvals;
   state.warnings = res.meta.warnings || [];
+  state.scanKind = deep ? "deep" : "quick";
   const meta = res.meta || {};
   const scanBits = deep
     ? meta.cached
-      ? " · cached full history"
-      : ` · full history: ${meta.eventWindows ?? "?"} windows, ${meta.eventHits ?? "?"} events (to block ${meta.headBlock ?? "?"})`
-    : " · quick (token list × routers)";
+      ? " · deep scan finished (cached)"
+      : ` · deep scan finished · ${meta.eventWindows ?? "?"} windows, ${meta.eventHits ?? "?"} events (to block ${meta.headBlock ?? "?"})`
+    : " · quick scan finished";
   const warn = state.warnings[0] && deep ? ` · ${esc(state.warnings[0])}` : "";
   setStatus(
     state.approvals.length
       ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"}${scanBits}.${warn}`
-      : `No live approvals yet${scanBits}.${warn}`,
-    state.approvals.length ? "ok" : deep ? "" : "busy",
+      : `No live approvals${scanBits}.${warn}`,
+    state.approvals.length ? "ok" : deep ? "ok" : "",
   );
 }
 
@@ -336,8 +347,8 @@ async function onScan(opts: { deep?: boolean } = {}) {
     if (!wantDeep) {
       setStatus(
         `${state.approvals.length
-          ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"} · quick`
-          : "No live approvals · quick"}. Deep scan is optional.`,
+          ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"} · quick scan finished`
+          : "No live approvals · quick scan finished"}. Deep scan is optional.`,
         state.approvals.length ? "ok" : "",
       );
     }
@@ -353,7 +364,7 @@ async function onScan(opts: { deep?: boolean } = {}) {
 
   // Deep history only when the user asks (Deep scan) — free Starkscan is slow / rate-limited
   setStatus(
-    `${state.approvals.length ? `Showing ${state.approvals.length} so far — ` : ""}deep history scan running…`,
+    `${state.approvals.length ? `Showing ${state.approvals.length} so far — ` : ""}Deep scan running…`,
     "busy",
   );
   try {
@@ -365,7 +376,7 @@ async function onScan(opts: { deep?: boolean } = {}) {
     state.phase = "ready";
     renderAll();
     setStatus(
-      `${state.approvals.length ? `Keeping quick results. ` : ""}${esc(
+      `Deep scan failed. ${state.approvals.length ? "Keeping quick results. " : ""}${esc(
         error instanceof Error ? error.message : String(error),
       )}`,
       state.approvals.length ? "ok" : "err",

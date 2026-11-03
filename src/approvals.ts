@@ -17,6 +17,7 @@ export type ApprovalsResponse = {
   address: string;
   approvals: ApprovalRow[];
   meta: {
+    mode?: "quick" | "full";
     curatedChecked: number;
     starkscanUsed: boolean;
     starkscanPages: number;
@@ -27,14 +28,18 @@ export type ApprovalsResponse = {
     eventWindows?: number;
     eventHits?: number;
     headBlock?: number;
+    cached?: boolean;
     warnings: string[];
   };
 };
 
-export async function fetchApprovals(owner: string): Promise<ApprovalsResponse> {
+export async function fetchApprovals(
+  owner: string,
+  mode: "quick" | "full" = "full",
+): Promise<ApprovalsResponse> {
   const address = normalizeAddress(owner);
   const base = import.meta.env.BASE_URL || "/tools/revoke/";
-  const url = `${base}api/approvals?address=${encodeURIComponent(address)}`;
+  const url = `${base}api/approvals?address=${encodeURIComponent(address)}&mode=${mode}`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   const body = (await res.json().catch(() => ({}))) as ApprovalsResponse & { error?: string };
   if (!res.ok) {

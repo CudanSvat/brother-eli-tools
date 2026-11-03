@@ -11,13 +11,12 @@ import { CURATED_SPENDERS, CURATED_TOKENS, normalizeAddress, spenderName, tokenM
 const STARKSCAN = "https://api.starkscan.co/v1/SN_MAIN";
 /** Inclusive window size for positional event search (Starkscan free-tier max). */
 const EVENT_BLOCK_SPAN = 10_000;
-const EVENT_WINDOW_CONCURRENCY = 6;
+const EVENT_WINDOW_CONCURRENCY = 8;
 const EVENT_PAGE_LIMIT = 100;
-const VERIFY_CONCURRENCY = 12;
-const HYDRATE_CONCURRENCY = 12;
-/** Only txs that look like explicit approve calls (legacy / non-indexed events). */
-const MAX_TX_PAGES_LIGHT = 50;
-const PAGE_LIMIT = 100;
+const VERIFY_CONCURRENCY = 16;
+const CACHE_TTL_MS = 5 * 60_000;
+/** In-memory full-scan cache (address → result). */
+const scanCache = new Map();
 
 const SELECTOR = {
   approve: hash.getSelectorFromName("approve"),
@@ -523,15 +522,50 @@ async function scanApprovalEvents(owner, apiKey, warnings) {
     return { candidates, windows: 0, events: 0, head: 0 };
   }
 
+  const ownerVariants = feltVariants(owner);
+  const topicApproval = SELECTOR.Approval;
+  const topicApprovalForAll = SELECTOR.ApprovalForAll;
+
+  // Skip empty genesis: binary-search the first 10k window with any Approval for this owner.
+  let startFrom = 0;
+  const lastIdx = Math.floor(head / EVENT_BLOCK_SPAN);
+  try {
+    let lo = 0;
+    let hi = lastIdx;
+    let firstIdx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const from = mid * EVENT_BLOCK_SPAN;
+      const to = Math.min(from + EVENT_BLOCK_SPAN - 1, head);
+      const hit = await fetchEventWindow(apiKey, topicApproval, ownerVariants, from, to);
+      const hit2 =
+        hit.length > 0
+          ? hit
+          : await fetchEventWindow(apiKey, topicApprovalForAll, ownerVariants, from, to);
+      if (hit2.length) {
+        firstIdx = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    if (firstIdx < 0) {
+      return { candidates, windows: 0, events: 0, head };
+    }
+    startFrom = firstIdx * EVENT_BLOCK_SPAN;
+  } catch (error) {
+    warnings.push(
+      `First-event probe failed, scanning from genesis: ${String(error.message || error).slice(0, 100)}`,
+    );
+    startFrom = 0;
+  }
+
   const windows = [];
-  for (let from = 0; from <= head; from += EVENT_BLOCK_SPAN) {
+  for (let from = startFrom; from <= head; from += EVENT_BLOCK_SPAN) {
     const to = Math.min(from + EVENT_BLOCK_SPAN - 1, head);
     windows.push({ from, to });
   }
 
-  const ownerVariants = feltVariants(owner);
-  const topicApproval = SELECTOR.Approval;
-  const topicApprovalForAll = SELECTOR.ApprovalForAll;
   let events = 0;
   let windowErrors = 0;
 
@@ -570,77 +604,21 @@ async function scanApprovalEvents(owner, apiKey, warnings) {
   return { candidates, windows: windows.length, events, head };
 }
 
-/** Supplement: hydrate txs that advertise approve* as primaryMethod (legacy). */
-async function scanExplicitApproveTxs(owner, apiKey, warnings) {
-  const candidates = new Map();
-  let cursor = null;
-  let pages = 0;
-  let listed = 0;
-  const hashes = [];
-  let hydrated = 0;
-
-  try {
-    while (pages < MAX_TX_PAGES_LIGHT) {
-      pages += 1;
-      const q = new URLSearchParams({ limit: String(PAGE_LIMIT) });
-      if (cursor) q.set("cursor", cursor);
-      const page = await starkscanGet(
-        `/address/${normalizeAddress(owner)}/transactions?${q}`,
-        apiKey,
-      );
-      const items = page.items || page.data || [];
-      listed += items.length;
-      for (const row of items) {
-        const h = row.txHash || row.tx_hash;
-        if (h && isExplicitApproveRow(row)) hashes.push(h);
-      }
-      cursor = page.nextCursor || page.next_cursor || null;
-      if (!cursor || !items.length) break;
-    }
-  } catch (error) {
-    warnings.push(`Tx list (approve*) failed: ${error.message || error}`);
-    return { candidates, listed, hydrated };
-  }
-
-  const unique = [...new Set(hashes)];
-  await mapPool(unique, HYDRATE_CONCURRENCY, async (txHash) => {
-    try {
-      const detail = await starkscanGet(`/tx/${txHash}`, apiKey);
-      hydrated += 1;
-      for (const parsed of extractApproveCandidates(detail, owner)) {
-        const key = candidateKey(parsed.token, parsed.spender, parsed.type);
-        if (parsed.revoked) candidates.delete(key);
-        else candidates.set(key, parsed);
-      }
-    } catch {
-      /* ignore single tx */
-    }
-  });
-
-  return { candidates, listed, hydrated };
-}
-
 async function scanStarkscan(owner, apiKey, warnings) {
-  const candidates = new Map();
-
+  // Full history = Approval events (indexed by owner). No per-tx walk —
+  // that's what made scans feel slow vs revoke.cash-style index lookups.
   const events = await scanApprovalEvents(owner, apiKey, warnings);
-  for (const [k, v] of events.candidates) candidates.set(k, v);
-
-  const txs = await scanExplicitApproveTxs(owner, apiKey, warnings);
-  for (const [k, v] of txs.candidates) {
-    if (!candidates.has(k)) candidates.set(k, v);
-  }
 
   const uniqWarn = [...new Set(warnings)];
   warnings.length = 0;
   warnings.push(...uniqWarn.slice(0, 10));
 
   return {
-    candidates,
+    candidates: events.candidates,
     pages: 0,
-    listed: txs.listed,
-    hydrated: txs.hydrated,
-    parsedHits: candidates.size,
+    listed: 0,
+    hydrated: 0,
+    parsedHits: events.candidates.size,
     capped: false,
     eventWindows: events.windows,
     eventHits: events.events,
@@ -648,22 +626,27 @@ async function scanStarkscan(owner, apiKey, warnings) {
   };
 }
 
-/**
- * Core scan used by HTTP handler.
- */
-export async function scanApprovals(ownerRaw) {
-  const owner = normalizeAddress(ownerRaw);
-  const warnings = [];
-  const apiKey = process.env.STARKSCAN_API_KEY || "";
-  const map = new Map();
+function sortApprovals(list) {
+  return [...list].sort((a, b) => {
+    const score = (r) => {
+      if (r.type !== "erc20") return 3;
+      try {
+        const v = BigInt(r.amount || "0");
+        if (v >= 1n << 255n) return 2;
+        return 1;
+      } catch {
+        return 0;
+      }
+    };
+    return score(b) - score(a);
+  });
+}
 
+async function runCuratedMatrix(owner, map) {
   const pairs = [];
   for (const token of CURATED_TOKENS) {
-    for (const spender of CURATED_SPENDERS) {
-      pairs.push({ token, spender });
-    }
+    for (const spender of CURATED_SPENDERS) pairs.push({ token, spender });
   }
-  const curatedChecked = pairs.length;
   await mapPool(pairs, VERIFY_CONCURRENCY, async ({ token, spender }) => {
     if (token.kind === "erc20") {
       const amount = await readAllowance(token.address, owner, spender.address);
@@ -695,30 +678,44 @@ export async function scanApprovals(ownerRaw) {
       }
     }
   });
+  return pairs.length;
+}
 
-  let starkscanPages = 0;
-  let starkscanListed = 0;
+/**
+ * @param {string} ownerRaw
+ * @param {{ mode?: 'quick' | 'full' }} [opts]
+ */
+export async function scanApprovals(ownerRaw, opts = {}) {
+  const mode = opts.mode === "quick" ? "quick" : "full";
+  const owner = normalizeAddress(ownerRaw);
+  const warnings = [];
+  const apiKey = process.env.STARKSCAN_API_KEY || "";
+  const map = new Map();
+
+  if (mode === "full") {
+    const cached = scanCache.get(owner);
+    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+      return { ...cached.result, meta: { ...cached.result.meta, cached: true, mode: "full" } };
+    }
+  }
+
+  const curatedChecked = await runCuratedMatrix(owner, map);
+
   let starkscanUsed = false;
-  let starkscanHydrated = 0;
-  let starkscanParsed = 0;
-  let starkscanCapped = false;
   let eventWindows = 0;
   let eventHits = 0;
   let headBlock = 0;
-  if (apiKey) {
+  let starkscanParsed = 0;
+
+  if (mode === "full" && apiKey) {
     starkscanUsed = true;
     const scanned = await scanStarkscan(owner, apiKey, warnings);
-    const { candidates, pages, listed, hydrated, parsedHits, capped } = scanned;
-    starkscanPages = pages;
-    starkscanListed = listed;
-    starkscanHydrated = hydrated;
-    starkscanParsed = parsedHits;
-    starkscanCapped = !!capped;
     eventWindows = scanned.eventWindows || 0;
     eventHits = scanned.eventHits || 0;
     headBlock = scanned.headBlock || 0;
+    starkscanParsed = scanned.parsedHits || 0;
 
-    const toVerify = [...candidates.values()];
+    const toVerify = [...scanned.candidates.values()];
     await mapPool(toVerify, VERIFY_CONCURRENCY, async (c) => {
       if (c.type === "erc20") {
         const amount = await readAllowance(c.token, owner, c.spender);
@@ -750,41 +747,36 @@ export async function scanApprovals(ownerRaw) {
         });
       }
     });
-  } else {
-    warnings.push("No STARKSCAN_API_KEY — showing curated token×spender hits only.");
+  } else if (mode === "full" && !apiKey) {
+    warnings.push("No STARKSCAN_API_KEY — curated routers only.");
+  } else if (mode === "quick") {
+    warnings.push("Quick scan (known tokens × routers). Deep history runs next…");
   }
 
-  const approvals = [...map.values()].sort((a, b) => {
-    const score = (r) => {
-      if (r.type !== "erc20") return 3;
-      try {
-        const v = BigInt(r.amount || "0");
-        if (v >= 1n << 255n) return 2;
-        return 1;
-      } catch {
-        return 0;
-      }
-    };
-    return score(b) - score(a);
-  });
-
-  return {
+  const result = {
     address: owner,
-    approvals,
+    approvals: sortApprovals([...map.values()]),
     meta: {
+      mode,
       curatedChecked,
       starkscanUsed,
-      starkscanPages,
-      starkscanListed,
-      starkscanHydrated,
+      starkscanPages: 0,
+      starkscanListed: 0,
+      starkscanHydrated: 0,
       starkscanParsed,
-      starkscanCapped,
+      starkscanCapped: false,
       eventWindows,
       eventHits,
       headBlock,
+      cached: false,
       warnings,
     },
   };
+
+  if (mode === "full" && apiKey) {
+    scanCache.set(owner, { at: Date.now(), result });
+  }
+  return result;
 }
 
 function shortSym(addr) {
@@ -828,8 +820,9 @@ export async function handleApprovalsRequest(req, res) {
     return;
   }
 
+  const mode = u.searchParams.get("mode") === "quick" ? "quick" : "full";
   try {
-    const result = await scanApprovals(address);
+    const result = await scanApprovals(address, { mode });
     sendJson(res, 200, result);
   } catch (error) {
     console.error("scanApprovals:", error);

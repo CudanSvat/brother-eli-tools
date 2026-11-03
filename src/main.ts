@@ -300,34 +300,61 @@ async function onDisconnect() {
   setStatus("");
 }
 
+function applyScanResult(res: Awaited<ReturnType<typeof fetchApprovals>>, deep: boolean) {
+  state.approvals = res.approvals;
+  state.warnings = res.meta.warnings || [];
+  const meta = res.meta || {};
+  const scanBits = deep
+    ? meta.cached
+      ? " · cached full history"
+      : ` · full history: ${meta.eventWindows ?? "?"} windows, ${meta.eventHits ?? "?"} events (to block ${meta.headBlock ?? "?"})`
+    : " · quick (known routers)";
+  const warn = state.warnings[0] && deep ? ` · ${esc(state.warnings[0])}` : "";
+  setStatus(
+    state.approvals.length
+      ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"}${scanBits}.${warn}`
+      : `No live approvals yet${scanBits}.${warn}`,
+    state.approvals.length ? "ok" : deep ? "" : "busy",
+  );
+}
+
 async function onScan() {
   if (!state.address) return;
   state.phase = "scanning";
   state.selected.clear();
   renderAll();
-  setStatus("Scanning full approval history (events + live RPC)…", "busy");
+
+  // 1) Instant feel — curated routers (what most “quick” revoke UIs show first)
+  setStatus("Quick scan (known tokens × routers)…", "busy");
   try {
-    const res = await fetchApprovals(state.address);
-    state.approvals = res.approvals;
-    state.warnings = res.meta.warnings || [];
+    const quick = await fetchApprovals(state.address, "quick");
     state.phase = "ready";
+    applyScanResult(quick, false);
     renderAll();
-    const meta = res.meta || {};
-    const scanBits = meta.starkscanUsed
-      ? ` · full history: ${meta.eventWindows ?? "?"} block windows, ${meta.eventHits ?? "?"} approval events through block ${meta.headBlock ?? "?"}`
-      : " · curated only";
-    const warn = state.warnings[0] ? ` · ${esc(state.warnings[0])}` : "";
-    setStatus(
-      state.approvals.length
-        ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"}${scanBits}.${warn}`
-        : `No live approvals on this pass${scanBits}.${warn}`,
-      state.approvals.length ? "ok" : "",
-    );
+  } catch (error) {
+    // Still try full scan
+    setStatus(esc(error instanceof Error ? error.message : String(error)), "err");
+  }
+
+  // 2) Deep history — Approval events across the chain (old dangerous allowances)
+  setStatus(
+    `${state.approvals.length ? `Showing ${state.approvals.length} so far — ` : ""}deep history scan running…`,
+    "busy",
+  );
+  try {
+    const full = await fetchApprovals(state.address, "full");
+    state.phase = "ready";
+    applyScanResult(full, true);
+    renderAll();
   } catch (error) {
     state.phase = "ready";
-    state.approvals = [];
     renderAll();
-    setStatus(esc(error instanceof Error ? error.message : String(error)), "err");
+    setStatus(
+      `${state.approvals.length ? `Keeping quick results. ` : ""}${esc(
+        error instanceof Error ? error.message : String(error),
+      )}`,
+      state.approvals.length ? "ok" : "err",
+    );
   }
 }
 

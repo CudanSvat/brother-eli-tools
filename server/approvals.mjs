@@ -7,7 +7,8 @@
  */
 import { hash } from "starknet";
 import {
-  CURATED_SPENDERS,
+  SEED_TOKENS,
+  getSpenderUniverse,
   getTokenUniverse,
   normalizeAddress,
   spenderName,
@@ -658,13 +659,22 @@ function sortApprovals(list) {
 }
 
 async function runCuratedMatrix(owner, map, apiKey) {
-  const tokens = await getTokenUniverse(owner, apiKey);
+  const [tokens, spenders] = await Promise.all([
+    getTokenUniverse(owner, apiKey),
+    getSpenderUniverse(),
+  ]);
+  const seedSet = new Set(SEED_TOKENS.map((t) => normalizeAddress(t.address)));
+  // Majors × every spender first (Troves/Vesu/Endur hit here), then other tokens × hubs.
   const pairs = [];
+  const hubSpenders = spenders.filter((s) => !String(s.name || "").startsWith("Troves "));
+  const troves = spenders.filter((s) => String(s.name || "").startsWith("Troves "));
   for (const token of tokens) {
-    for (const spender of CURATED_SPENDERS) pairs.push({ token, spender });
+    const isSeed = seedSet.has(normalizeAddress(token.address));
+    const list = isSeed ? spenders : hubSpenders;
+    for (const spender of list) pairs.push({ token, spender });
   }
-  // Cap pair fanout so AVNU list × routers stays responsive
-  const capped = pairs.length > 2500 ? pairs.slice(0, 2500) : pairs;
+  // Cap fanout — ~seed×(hubs+troves) + avnu×hubs stays under Alchemy comfort
+  const capped = pairs.length > 8000 ? pairs.slice(0, 8000) : pairs;
   await mapPool(capped, VERIFY_CONCURRENCY, async ({ token, spender }) => {
     if (token.kind === "erc20") {
       const amount = await readAllowance(token.address, owner, spender.address);
@@ -696,7 +706,12 @@ async function runCuratedMatrix(owner, map, apiKey) {
       }
     }
   });
-  return { checked: capped.length, tokenCount: tokens.length, spenderCount: CURATED_SPENDERS.length };
+  return {
+    checked: capped.length,
+    tokenCount: tokens.length,
+    spenderCount: spenders.length,
+    trovesVaults: troves.length,
+  };
 }
 
 /**
@@ -770,7 +785,7 @@ export async function scanApprovals(ownerRaw, opts = {}) {
     warnings.push("No STARKSCAN_API_KEY — curated routers only.");
   } else if (mode === "quick") {
     warnings.push(
-      `Quick: ${curated.tokenCount} tokens × ${curated.spenderCount} known routers (AVNU list + your transfers). Deep history next…`,
+      `Quick: ${curated.tokenCount} tokens × ${curated.spenderCount} spenders (DEX/lending/vaults + Troves).`,
     );
   }
 

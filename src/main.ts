@@ -102,6 +102,7 @@ function renderWallet() {
          </div>
          <div class="ticket-actions">
            <button type="button" class="ghost" id="btn-rescan" ${state.phase === "scanning" ? "disabled" : ""}>Rescan</button>
+           <button type="button" class="ghost" id="btn-deep" ${state.phase === "scanning" ? "disabled" : ""}>Deep scan</button>
            <button type="button" class="ghost" id="btn-disconnect">Disconnect</button>
          </div>
        </div>`
@@ -112,7 +113,8 @@ function renderWallet() {
 
   $("#btn-connect")?.addEventListener("click", () => void onConnect());
   $("#btn-disconnect")?.addEventListener("click", () => void onDisconnect());
-  $("#btn-rescan")?.addEventListener("click", () => void onScan());
+  $("#btn-rescan")?.addEventListener("click", () => void onScan({ deep: false }));
+  $("#btn-deep")?.addEventListener("click", () => void onScan({ deep: true }));
 }
 
 function renderTools() {
@@ -163,14 +165,14 @@ function renderList() {
     box.innerHTML = `<div class="empty"><b>No wallet yet</b><span>Connect Ready, Braavos, Bramble, Xverse, or Cartridge to scan live allowances.</span></div>`;
     return;
   }
-  if (state.phase === "scanning") {
-    box.innerHTML = `<div class="empty"><b>Scanning</b><span>Checking curated routers, then Starkscan history when a key is set.</span></div>`;
+  if (state.phase === "scanning" && !state.approvals.length) {
+    box.innerHTML = `<div class="empty"><b>Scanning</b><span>Checking known tokens × routers. Use Deep scan for full Approval history.</span></div>`;
     return;
   }
   if (!state.approvals.length) {
     const hint = state.warnings[0]
       ? esc(state.warnings[0])
-      : "No live allowances after curated check + Starkscan history. If that feels wrong, hit Rescan or tell us — nested swap approvals need the latest scanner.";
+      : "No live allowances on the quick pass. Hit Deep scan for full history, or Rescan after a revoke settles.";
     box.innerHTML = `<div class="empty"><b>Clean</b><span>${hint}</span></div>`;
     return;
   }
@@ -318,25 +320,38 @@ function applyScanResult(res: Awaited<ReturnType<typeof fetchApprovals>>, deep: 
   );
 }
 
-async function onScan() {
+async function onScan(opts: { deep?: boolean } = {}) {
   if (!state.address) return;
+  const wantDeep = !!opts.deep;
   state.phase = "scanning";
   state.selected.clear();
   renderAll();
 
-  // 1) Instant feel — curated routers (what most “quick” revoke UIs show first)
+  // Quick pass — curated tokens × routers (default after connect / revoke / Rescan)
   setStatus("Quick scan (known tokens × routers)…", "busy");
   try {
     const quick = await fetchApprovals(state.address, "quick");
     state.phase = "ready";
     applyScanResult(quick, false);
+    if (!wantDeep) {
+      setStatus(
+        `${state.approvals.length
+          ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"} · quick`
+          : "No live approvals · quick"}. Deep scan is optional.`,
+        state.approvals.length ? "ok" : "",
+      );
+    }
     renderAll();
   } catch (error) {
-    // Still try full scan
+    state.phase = "ready";
+    renderAll();
     setStatus(esc(error instanceof Error ? error.message : String(error)), "err");
+    if (!wantDeep) return;
   }
 
-  // 2) Deep history — Approval events across the chain (old dangerous allowances)
+  if (!wantDeep) return;
+
+  // Deep history only when the user asks (Deep scan) — free Starkscan is slow / rate-limited
   setStatus(
     `${state.approvals.length ? `Showing ${state.approvals.length} so far — ` : ""}deep history scan running…`,
     "busy",
@@ -380,7 +395,7 @@ async function onRevoke() {
       "ok",
     );
     await new Promise((r) => setTimeout(r, 4000));
-    await onScan();
+    await onScan({ deep: false });
   } catch (error) {
     state.phase = "ready";
     renderAll();
@@ -396,8 +411,8 @@ void pickWallet(true).then(async (wallet) => {
     state.wallet = wallet;
     state.walletName = wallet.name || wallet.id || "Wallet";
     state.address = await requestAddress(wallet, true);
-    state.unwatch = onWalletChange(wallet, () => void onScan());
-    await onScan();
+    state.unwatch = onWalletChange(wallet, () => void onScan({ deep: false }));
+    await onScan({ deep: false });
   } catch {
     /* silent reconnect failed — user can click Connect */
   }

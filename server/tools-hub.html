@@ -146,8 +146,11 @@
 
       .grid {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 18px;
+      }
+      @media (min-width: 900px) {
+        .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       }
 
       .card {
@@ -168,6 +171,7 @@
       }
       .card:nth-child(2) { --tilt: .7deg; }
       .card:nth-child(3) { --tilt: -.4deg; }
+      .card:nth-child(4) { --tilt: .5deg; }
       .card.is-live:hover {
         z-index: 2;
         transform: translateY(-4px) rotate(calc(var(--tilt) * -1));
@@ -248,6 +252,21 @@
         letter-spacing: .08em;
         text-transform: uppercase;
       }
+      .tg-teaser {
+        align-self: start;
+        z-index: 2;
+        display: inline-flex; align-items: center; gap: 8px;
+        min-height: 40px;
+        padding: 0 12px 0 10px;
+        border: 2px solid #11120f;
+        background: rgba(241, 232, 214, .92);
+        color: #11120f;
+        font: 400 14px/1 var(--caption);
+        letter-spacing: .06em;
+        text-transform: uppercase;
+        transform: rotate(-1.5deg);
+      }
+      .tg-teaser svg { width: 18px; height: 18px; flex: none; }
 
       .foot {
         margin: 40px auto 0;
@@ -297,7 +316,7 @@
           </div>
         </div>
 
-        <h2 class="grid-label">The board <em>3</em></h2>
+        <h2 class="grid-label">The board <em>4</em></h2>
         <div class="grid">
           <a class="card is-live" href="/tools/revoke/">
             <span class="badge-live">Live</span>
@@ -328,12 +347,27 @@
             </div>
             <span class="go">Locked</span>
           </div>
+
+          <div class="card is-soon" role="group" aria-label="OTC Pleb — coming soon on Telegram" aria-disabled="true">
+            <span class="stamp" aria-hidden="true">Soon</span>
+            <div class="body">
+              <div class="kicker">04 · Desk</div>
+              <strong>OTC Pleb</strong>
+              <p class="blurb">Pleb-sized OTC desk for brothers — trades that don’t need a DEX crowd.</p>
+            </div>
+            <span class="tg-teaser" title="Coming on Telegram">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path fill="currentColor" d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.695.064-1.226-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/>
+              </svg>
+              On Telegram
+            </span>
+          </div>
         </div>
       </section>
 
       <p class="foot">
-        <b>Brother Eli Tools.</b> Canonical path will be <code>brothereli.com/tools</code> once wired to the main site.
-        Until then use this Railway host. ·
+        <b>Brother Eli Tools.</b> Live at <a href="https://brothereli.com/tools/">brothereli.com/tools</a>.
+        Keys stay in your wallet. ·
         <a href="https://brothereli.com">brothereli.com</a>
       </p>
     </main>

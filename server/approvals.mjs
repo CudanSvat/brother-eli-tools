@@ -9,9 +9,14 @@ import { hash } from "starknet";
 import { CURATED_SPENDERS, CURATED_TOKENS, normalizeAddress, spenderName, tokenMeta } from "./tokens.mjs";
 
 const STARKSCAN = "https://api.starkscan.co/v1/SN_MAIN";
-const MAX_TX_PAGES = 20;
+/** List many pages fast (cursor). Not the same as “how many txs you have”. */
+const MAX_TX_PAGES = 30;
 const PAGE_LIMIT = 100;
-const MAX_HYDRATE = 120;
+/** Detail fetches are expensive — prioritize approve-like, then fill with recent. */
+const MAX_HYDRATE_PRIORITY = 80;
+const MAX_HYDRATE_RECENT = 40;
+const HYDRATE_CONCURRENCY = 12;
+const VERIFY_CONCURRENCY = 10;
 
 const SELECTOR = {
   approve: hash.getSelectorFromName("approve"),
@@ -374,29 +379,45 @@ function trySliceFromAccountCalls(accountCalls, calldata) {
   return out;
 }
 
-function shouldHydrateTx(row) {
+function isSucceededInvoke(row) {
   const type = String(row.txType || row.tx_type || "").toUpperCase();
   if (type && type !== "INVOKE") return false;
   const status = String(row.executionStatus || row.execution_status || "").toUpperCase();
-  if (status && status !== "SUCCEEDED" && status !== "REVERTED" && status !== "SUCCESS") {
-    // still hydrate unknowns
-  }
-  if (status === "REVERTED") return false;
+  if (status === "REVERTED" || status === "REJECTED") return false;
+  return true;
+}
 
+/** High chance of an approve nested or as primary method. */
+function isPriorityApproveRow(row) {
+  if (!isSucceededInvoke(row)) return false;
   const method = String(row.primaryMethod || row.primary_method || "").toLowerCase();
   if (APPROVE_METHOD_NAMES.has(method)) return true;
+  if (/approve|allowance|operator/i.test(method)) return true;
   if (row.methodsDiffer || row.methods_differ) return true;
-  // Nested approve inside swaps: primaryMethod is often the swap name
-  const calls = row.callCount ?? row.call_count;
-  if (calls == null || calls >= 1) return true;
-  return true;
+  return false;
+}
+
+async function mapPool(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function run() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  const runners = Array.from({ length: Math.min(concurrency, items.length) || 1 }, () => run());
+  await Promise.all(runners);
+  return results;
 }
 
 async function scanStarkscan(owner, apiKey, warnings) {
   const candidates = new Map();
   let cursor = null;
   let pages = 0;
-  const hashes = [];
+  let listed = 0;
+  const priority = [];
+  const recent = [];
   let hydrated = 0;
   let parsedHits = 0;
 
@@ -410,21 +431,39 @@ async function scanStarkscan(owner, apiKey, warnings) {
         apiKey,
       );
       const items = page.items || page.data || [];
+      listed += items.length;
       for (const row of items) {
-        if (!shouldHydrateTx(row)) continue;
         const h = row.txHash || row.tx_hash;
-        if (h) hashes.push(h);
+        if (!h || !isSucceededInvoke(row)) continue;
+        if (isPriorityApproveRow(row)) priority.push(h);
+        else recent.push(h);
       }
       cursor = page.nextCursor || page.next_cursor || null;
       if (!cursor || !items.length) break;
     }
   } catch (error) {
     warnings.push(`Starkscan list failed: ${error.message || error}`);
-    return { candidates, pages, hydrated, parsedHits };
+    return { candidates, pages, listed, hydrated, parsedHits, capped: false };
   }
 
-  const unique = [...new Set(hashes)].slice(0, MAX_HYDRATE);
-  for (const txHash of unique) {
+  const picked = [];
+  const seen = new Set();
+  for (const h of priority) {
+    if (seen.has(h)) continue;
+    seen.add(h);
+    picked.push(h);
+    if (picked.length >= MAX_HYDRATE_PRIORITY) break;
+  }
+  for (const h of recent) {
+    if (seen.has(h)) continue;
+    seen.add(h);
+    picked.push(h);
+    if (picked.length >= MAX_HYDRATE_PRIORITY + MAX_HYDRATE_RECENT) break;
+  }
+
+  const capped = priority.length + recent.length > picked.length;
+
+  await mapPool(picked, HYDRATE_CONCURRENCY, async (txHash) => {
     try {
       const detail = await starkscanGet(`/tx/${txHash}`, apiKey);
       hydrated += 1;
@@ -434,20 +473,30 @@ async function scanStarkscan(owner, apiKey, warnings) {
         if (parsed.revoked) candidates.delete(key);
         else candidates.set(key, parsed);
       }
-    } catch (error) {
+    } catch {
       warnings.push(`Tx hydrate failed for ${String(txHash).slice(0, 12)}…`);
     }
-  }
+  });
 
-  if (!unique.length) {
-    warnings.push("Starkscan returned no invoke txs to scan (empty history or filter).");
+  // Dedupe hydrate warnings (can spam under concurrency)
+  const uniqWarn = [...new Set(warnings)];
+  warnings.length = 0;
+  warnings.push(...uniqWarn.slice(0, 8));
+
+  if (!picked.length) {
+    warnings.push("Starkscan returned no invoke txs to detail-scan.");
   } else if (!parsedHits) {
     warnings.push(
-      `Scanned ${hydrated} txs but found no Approval/approve payloads — decode may need a tweak.`,
+      `Opened ${hydrated} tx details but found no Approval/approve payloads.`,
+    );
+  }
+  if (capped) {
+    warnings.push(
+      `Detail cap hit: listed ${listed} txs, opened ${picked.length} details (not your full history).`,
     );
   }
 
-  return { candidates, pages, hydrated, parsedHits };
+  return { candidates, pages, listed, hydrated, parsedHits, capped };
 }
 
 /**
@@ -459,56 +508,69 @@ export async function scanApprovals(ownerRaw) {
   const apiKey = process.env.STARKSCAN_API_KEY || "";
   const map = new Map();
 
-  let curatedChecked = 0;
+  const pairs = [];
   for (const token of CURATED_TOKENS) {
     for (const spender of CURATED_SPENDERS) {
-      curatedChecked += 1;
-      if (token.kind === "erc20") {
-        const amount = await readAllowance(token.address, owner, spender.address);
-        if (amount > 0n) {
-          map.set(candidateKey(token.address, spender.address, "erc20"), {
-            token: normalizeAddress(token.address),
-            spender: normalizeAddress(spender.address),
-            type: "erc20",
-            amount: amount.toString(),
-            symbol: token.symbol,
-            decimals: token.decimals,
-            spenderName: spender.name,
-            source: "curated",
-          });
-        }
-      } else {
-        const ok = await readOperator(token.address, owner, spender.address);
-        if (ok) {
-          map.set(candidateKey(token.address, spender.address, "erc721_operator"), {
-            token: normalizeAddress(token.address),
-            spender: normalizeAddress(spender.address),
-            type: "erc721_operator",
-            amount: null,
-            symbol: token.symbol,
-            decimals: 0,
-            spenderName: spender.name,
-            source: "curated",
-          });
-        }
-      }
+      pairs.push({ token, spender });
     }
   }
+  const curatedChecked = pairs.length;
+  await mapPool(pairs, VERIFY_CONCURRENCY, async ({ token, spender }) => {
+    if (token.kind === "erc20") {
+      const amount = await readAllowance(token.address, owner, spender.address);
+      if (amount > 0n) {
+        map.set(candidateKey(token.address, spender.address, "erc20"), {
+          token: normalizeAddress(token.address),
+          spender: normalizeAddress(spender.address),
+          type: "erc20",
+          amount: amount.toString(),
+          symbol: token.symbol,
+          decimals: token.decimals,
+          spenderName: spender.name,
+          source: "curated",
+        });
+      }
+    } else {
+      const ok = await readOperator(token.address, owner, spender.address);
+      if (ok) {
+        map.set(candidateKey(token.address, spender.address, "erc721_operator"), {
+          token: normalizeAddress(token.address),
+          spender: normalizeAddress(spender.address),
+          type: "erc721_operator",
+          amount: null,
+          symbol: token.symbol,
+          decimals: 0,
+          spenderName: spender.name,
+          source: "curated",
+        });
+      }
+    }
+  });
 
   let starkscanPages = 0;
+  let starkscanListed = 0;
   let starkscanUsed = false;
   let starkscanHydrated = 0;
   let starkscanParsed = 0;
+  let starkscanCapped = false;
   if (apiKey) {
     starkscanUsed = true;
-    const { candidates, pages, hydrated, parsedHits } = await scanStarkscan(owner, apiKey, warnings);
+    const { candidates, pages, listed, hydrated, parsedHits, capped } = await scanStarkscan(
+      owner,
+      apiKey,
+      warnings,
+    );
     starkscanPages = pages;
+    starkscanListed = listed;
     starkscanHydrated = hydrated;
     starkscanParsed = parsedHits;
-    for (const c of candidates.values()) {
+    starkscanCapped = !!capped;
+
+    const toVerify = [...candidates.values()];
+    await mapPool(toVerify, VERIFY_CONCURRENCY, async (c) => {
       if (c.type === "erc20") {
         const amount = await readAllowance(c.token, owner, c.spender);
-        if (amount === 0n) continue;
+        if (amount === 0n) return;
         const meta = tokenMeta(c.token);
         map.set(candidateKey(c.token, c.spender, "erc20"), {
           token: c.token,
@@ -522,7 +584,7 @@ export async function scanApprovals(ownerRaw) {
         });
       } else {
         const ok = await readOperator(c.token, owner, c.spender);
-        if (!ok) continue;
+        if (!ok) return;
         const meta = tokenMeta(c.token);
         map.set(candidateKey(c.token, c.spender, c.type), {
           token: c.token,
@@ -535,7 +597,7 @@ export async function scanApprovals(ownerRaw) {
           source: "starkscan",
         });
       }
-    }
+    });
   } else {
     warnings.push("No STARKSCAN_API_KEY — showing curated token×spender hits only.");
   }
@@ -561,8 +623,10 @@ export async function scanApprovals(ownerRaw) {
       curatedChecked,
       starkscanUsed,
       starkscanPages,
+      starkscanListed,
       starkscanHydrated,
       starkscanParsed,
+      starkscanCapped,
       warnings,
     },
   };

@@ -314,7 +314,9 @@ async function onScan() {
     renderAll();
     const meta = res.meta || {};
     const scanBits = meta.starkscanUsed
-      ? ` · Starkscan ${meta.starkscanHydrated ?? "?"} txs`
+      ? ` · listed ${meta.starkscanListed ?? "?"} txs, opened ${meta.starkscanHydrated ?? "?"} details${
+          meta.starkscanCapped ? " (detail cap)" : ""
+        }`
       : " · curated only";
     const warn = state.warnings[0] ? ` · ${esc(state.warnings[0])}` : "";
     setStatus(

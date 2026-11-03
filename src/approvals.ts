@@ -24,6 +24,9 @@ export type ApprovalsResponse = {
     starkscanHydrated?: number;
     starkscanParsed?: number;
     starkscanCapped?: boolean;
+    eventWindows?: number;
+    eventHits?: number;
+    headBlock?: number;
     warnings: string[];
   };
 };

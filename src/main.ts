@@ -305,7 +305,7 @@ async function onScan() {
   state.phase = "scanning";
   state.selected.clear();
   renderAll();
-  setStatus("Scanning live allowances…", "busy");
+  setStatus("Scanning full approval history (events + live RPC)…", "busy");
   try {
     const res = await fetchApprovals(state.address);
     state.approvals = res.approvals;
@@ -314,9 +314,7 @@ async function onScan() {
     renderAll();
     const meta = res.meta || {};
     const scanBits = meta.starkscanUsed
-      ? ` · listed ${meta.starkscanListed ?? "?"} txs, opened ${meta.starkscanHydrated ?? "?"} details${
-          meta.starkscanCapped ? " (detail cap)" : ""
-        }`
+      ? ` · full history: ${meta.eventWindows ?? "?"} block windows, ${meta.eventHits ?? "?"} approval events through block ${meta.headBlock ?? "?"}`
       : " · curated only";
     const warn = state.warnings[0] ? ` · ${esc(state.warnings[0])}` : "";
     setStatus(

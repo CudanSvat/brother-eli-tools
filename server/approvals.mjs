@@ -1,22 +1,23 @@
 /**
  * Approvals discovery for Brother Eli Revoke.
- * Curated token×spender matrix + Starkscan history, then live RPC verify.
- *
- * Starkscan accountCalls are { to, selector, calldataLen } only — no calldata.
- * We decode the tx calldata blob and/or Approval / ApprovalForAll logs.
+ * 1) Curated token×spender RPC matrix (fast)
+ * 2) Full-chain Starkscan Approval / ApprovalForAll event walk (oldest → newest)
+ * 3) Light hydrate of txs whose primaryMethod is approve* (legacy non-indexed events)
+ * Then live RPC verify.
  */
 import { hash } from "starknet";
 import { CURATED_SPENDERS, CURATED_TOKENS, normalizeAddress, spenderName, tokenMeta } from "./tokens.mjs";
 
 const STARKSCAN = "https://api.starkscan.co/v1/SN_MAIN";
-/** List many pages fast (cursor). Not the same as “how many txs you have”. */
-const MAX_TX_PAGES = 30;
-const PAGE_LIMIT = 100;
-/** Detail fetches are expensive — prioritize approve-like, then fill with recent. */
-const MAX_HYDRATE_PRIORITY = 80;
-const MAX_HYDRATE_RECENT = 40;
+/** Inclusive window size for positional event search (Starkscan free-tier max). */
+const EVENT_BLOCK_SPAN = 10_000;
+const EVENT_WINDOW_CONCURRENCY = 6;
+const EVENT_PAGE_LIMIT = 100;
+const VERIFY_CONCURRENCY = 12;
 const HYDRATE_CONCURRENCY = 12;
-const VERIFY_CONCURRENCY = 10;
+/** Only txs that look like explicit approve calls (legacy / non-indexed events). */
+const MAX_TX_PAGES_LIGHT = 50;
+const PAGE_LIMIT = 100;
 
 const SELECTOR = {
   approve: hash.getSelectorFromName("approve"),
@@ -387,14 +388,10 @@ function isSucceededInvoke(row) {
   return true;
 }
 
-/** High chance of an approve nested or as primary method. */
-function isPriorityApproveRow(row) {
+function isExplicitApproveRow(row) {
   if (!isSucceededInvoke(row)) return false;
   const method = String(row.primaryMethod || row.primary_method || "").toLowerCase();
-  if (APPROVE_METHOD_NAMES.has(method)) return true;
-  if (/approve|allowance|operator/i.test(method)) return true;
-  if (row.methodsDiffer || row.methods_differ) return true;
-  return false;
+  return APPROVE_METHOD_NAMES.has(method) || /approve|allowance|approval_for_all/i.test(method);
 }
 
 async function mapPool(items, concurrency, worker) {
@@ -406,23 +403,184 @@ async function mapPool(items, concurrency, worker) {
       results[i] = await worker(items[i], i);
     }
   }
-  const runners = Array.from({ length: Math.min(concurrency, items.length) || 1 }, () => run());
+  const runners = Array.from({ length: Math.min(concurrency, Math.max(items.length, 1)) }, () => run());
   await Promise.all(runners);
   return results;
 }
 
-async function scanStarkscan(owner, apiKey, warnings) {
+function feltVariants(addr) {
+  const padded = normalizeAddress(addr);
+  const stripped = `0x${padded.slice(2).replace(/^0+/, "") || "0"}`;
+  return [...new Set([padded, stripped])];
+}
+
+async function latestBlockNumber() {
+  const hex = await rpcCall("starknet_blockNumber", []);
+  if (typeof hex === "number") return hex;
+  return Number(feltToBigInt(hex));
+}
+
+function applyEventToCandidates(candidates, ev, owner) {
+  const ownerN = normalizeAddress(owner);
+  const name = String(ev.eventName || "").toLowerCase();
+  const topic0 = ev.topic0 ? normFelt(ev.topic0) : "";
+  const keys = Array.isArray(ev.keys) ? ev.keys : [];
+  const data = Array.isArray(ev.data) ? ev.data : [];
+  const isApproval = name === "approval" || topic0 === normFelt(SELECTOR.Approval);
+  const isApprovalForAll =
+    name === "approvalforall" || topic0 === normFelt(SELECTOR.ApprovalForAll);
+
+  const order =
+    BigInt(ev.blockNumber || 0) * 1_000_000_000n +
+    BigInt(ev.txIndex || 0) * 10_000n +
+    BigInt(ev.logIndex || 0);
+
+  if (isApproval) {
+    let ownerFelt = ev.topic1 || keys[1];
+    let spenderFelt = ev.topic2 || keys[2];
+    let low = data[0];
+    let high = data[1];
+    if ((!ownerFelt || !spenderFelt) && data.length >= 4) {
+      ownerFelt = data[0];
+      spenderFelt = data[1];
+      low = data[2];
+      high = data[3];
+    }
+    if (!ownerFelt || !spenderFelt) return;
+    if (normalizeAddress(ownerFelt) !== ownerN) return;
+    const amount = parseU256(low ?? "0x0", high ?? "0x0");
+    const key = candidateKey(ev.address, spenderFelt, "erc20");
+    const prev = candidates.get(key);
+    if (prev && prev._order > order) return;
+    candidates.set(key, {
+      token: normalizeAddress(ev.address),
+      spender: normalizeAddress(spenderFelt),
+      type: "erc20",
+      amount,
+      revoked: amount === 0n,
+      _order: order,
+    });
+    return;
+  }
+
+  if (isApprovalForAll) {
+    let ownerFelt = ev.topic1 || keys[1];
+    let operatorFelt = ev.topic2 || keys[2];
+    let approvedFelt = data[0];
+    if ((!ownerFelt || !operatorFelt) && data.length >= 3) {
+      ownerFelt = data[0];
+      operatorFelt = data[1];
+      approvedFelt = data[2];
+    }
+    if (!ownerFelt || !operatorFelt) return;
+    if (normalizeAddress(ownerFelt) !== ownerN) return;
+    const approved = feltToBigInt(approvedFelt) !== 0n;
+    const key = candidateKey(ev.address, operatorFelt, "erc721_operator");
+    const prev = candidates.get(key);
+    if (prev && prev._order > order) return;
+    candidates.set(key, {
+      token: normalizeAddress(ev.address),
+      spender: normalizeAddress(operatorFelt),
+      type: "erc721_operator",
+      amount: null,
+      revoked: !approved,
+      _order: order,
+    });
+  }
+}
+
+async function fetchEventWindow(apiKey, topic0, ownerVariants, fromBlock, toBlock) {
+  const items = [];
+  let cursor = null;
+  for (let guard = 0; guard < 40; guard++) {
+    const q = new URLSearchParams();
+    q.set("topic0", topic0);
+    for (const v of ownerVariants) q.append("topic1", v);
+    q.set("from_block", String(fromBlock));
+    q.set("to_block", String(toBlock));
+    q.set("limit", String(EVENT_PAGE_LIMIT));
+    if (cursor) q.set("cursor", cursor);
+    const page = await starkscanGet(`/events?${q}`, apiKey);
+    const batch = page.items || page.data || [];
+    items.push(...batch);
+    cursor = page.nextCursor || page.next_cursor || null;
+    if (!cursor || !batch.length) break;
+  }
+  return items;
+}
+
+/**
+ * Full-history Approval walk: every 10k-block window from genesis → head,
+ * filtered to this owner as topic1 (SNIP-13 indexed Approval / ApprovalForAll).
+ */
+async function scanApprovalEvents(owner, apiKey, warnings) {
+  const candidates = new Map();
+  let head = 0;
+  try {
+    head = await latestBlockNumber();
+  } catch (error) {
+    warnings.push(`Could not read chain head: ${error.message || error}`);
+    return { candidates, windows: 0, events: 0, head: 0 };
+  }
+
+  const windows = [];
+  for (let from = 0; from <= head; from += EVENT_BLOCK_SPAN) {
+    const to = Math.min(from + EVENT_BLOCK_SPAN - 1, head);
+    windows.push({ from, to });
+  }
+
+  const ownerVariants = feltVariants(owner);
+  const topicApproval = SELECTOR.Approval;
+  const topicApprovalForAll = SELECTOR.ApprovalForAll;
+  let events = 0;
+  let windowErrors = 0;
+
+  await mapPool(windows, EVENT_WINDOW_CONCURRENCY, async ({ from, to }) => {
+    try {
+      const [a, b] = await Promise.all([
+        fetchEventWindow(apiKey, topicApproval, ownerVariants, from, to),
+        fetchEventWindow(apiKey, topicApprovalForAll, ownerVariants, from, to),
+      ]);
+      for (const ev of [...a, ...b]) {
+        events += 1;
+        applyEventToCandidates(candidates, ev, owner);
+      }
+    } catch (error) {
+      windowErrors += 1;
+      if (windowErrors <= 3) {
+        warnings.push(
+          `Event window ${from}-${to} failed: ${String(error.message || error).slice(0, 120)}`,
+        );
+      }
+    }
+  });
+
+  // Drop revoked (latest event was zero / false)
+  for (const [key, c] of [...candidates.entries()]) {
+    if (c.revoked) candidates.delete(key);
+    else delete c._order;
+  }
+
+  if (windowErrors) {
+    warnings.push(
+      `Event history incomplete: ${windowErrors}/${windows.length} windows failed (rate limit or coverage).`,
+    );
+  }
+
+  return { candidates, windows: windows.length, events, head };
+}
+
+/** Supplement: hydrate txs that advertise approve* as primaryMethod (legacy). */
+async function scanExplicitApproveTxs(owner, apiKey, warnings) {
   const candidates = new Map();
   let cursor = null;
   let pages = 0;
   let listed = 0;
-  const priority = [];
-  const recent = [];
+  const hashes = [];
   let hydrated = 0;
-  let parsedHits = 0;
 
   try {
-    while (pages < MAX_TX_PAGES) {
+    while (pages < MAX_TX_PAGES_LIGHT) {
       pages += 1;
       const q = new URLSearchParams({ limit: String(PAGE_LIMIT) });
       if (cursor) q.set("cursor", cursor);
@@ -434,69 +592,60 @@ async function scanStarkscan(owner, apiKey, warnings) {
       listed += items.length;
       for (const row of items) {
         const h = row.txHash || row.tx_hash;
-        if (!h || !isSucceededInvoke(row)) continue;
-        if (isPriorityApproveRow(row)) priority.push(h);
-        else recent.push(h);
+        if (h && isExplicitApproveRow(row)) hashes.push(h);
       }
       cursor = page.nextCursor || page.next_cursor || null;
       if (!cursor || !items.length) break;
     }
   } catch (error) {
-    warnings.push(`Starkscan list failed: ${error.message || error}`);
-    return { candidates, pages, listed, hydrated, parsedHits, capped: false };
+    warnings.push(`Tx list (approve*) failed: ${error.message || error}`);
+    return { candidates, listed, hydrated };
   }
 
-  const picked = [];
-  const seen = new Set();
-  for (const h of priority) {
-    if (seen.has(h)) continue;
-    seen.add(h);
-    picked.push(h);
-    if (picked.length >= MAX_HYDRATE_PRIORITY) break;
-  }
-  for (const h of recent) {
-    if (seen.has(h)) continue;
-    seen.add(h);
-    picked.push(h);
-    if (picked.length >= MAX_HYDRATE_PRIORITY + MAX_HYDRATE_RECENT) break;
-  }
-
-  const capped = priority.length + recent.length > picked.length;
-
-  await mapPool(picked, HYDRATE_CONCURRENCY, async (txHash) => {
+  const unique = [...new Set(hashes)];
+  await mapPool(unique, HYDRATE_CONCURRENCY, async (txHash) => {
     try {
       const detail = await starkscanGet(`/tx/${txHash}`, apiKey);
       hydrated += 1;
       for (const parsed of extractApproveCandidates(detail, owner)) {
-        parsedHits += 1;
         const key = candidateKey(parsed.token, parsed.spender, parsed.type);
         if (parsed.revoked) candidates.delete(key);
         else candidates.set(key, parsed);
       }
     } catch {
-      warnings.push(`Tx hydrate failed for ${String(txHash).slice(0, 12)}…`);
+      /* ignore single tx */
     }
   });
 
-  // Dedupe hydrate warnings (can spam under concurrency)
+  return { candidates, listed, hydrated };
+}
+
+async function scanStarkscan(owner, apiKey, warnings) {
+  const candidates = new Map();
+
+  const events = await scanApprovalEvents(owner, apiKey, warnings);
+  for (const [k, v] of events.candidates) candidates.set(k, v);
+
+  const txs = await scanExplicitApproveTxs(owner, apiKey, warnings);
+  for (const [k, v] of txs.candidates) {
+    if (!candidates.has(k)) candidates.set(k, v);
+  }
+
   const uniqWarn = [...new Set(warnings)];
   warnings.length = 0;
-  warnings.push(...uniqWarn.slice(0, 8));
+  warnings.push(...uniqWarn.slice(0, 10));
 
-  if (!picked.length) {
-    warnings.push("Starkscan returned no invoke txs to detail-scan.");
-  } else if (!parsedHits) {
-    warnings.push(
-      `Opened ${hydrated} tx details but found no Approval/approve payloads.`,
-    );
-  }
-  if (capped) {
-    warnings.push(
-      `Detail cap hit: listed ${listed} txs, opened ${picked.length} details (not your full history).`,
-    );
-  }
-
-  return { candidates, pages, listed, hydrated, parsedHits, capped };
+  return {
+    candidates,
+    pages: 0,
+    listed: txs.listed,
+    hydrated: txs.hydrated,
+    parsedHits: candidates.size,
+    capped: false,
+    eventWindows: events.windows,
+    eventHits: events.events,
+    headBlock: events.head,
+  };
 }
 
 /**
@@ -553,18 +702,21 @@ export async function scanApprovals(ownerRaw) {
   let starkscanHydrated = 0;
   let starkscanParsed = 0;
   let starkscanCapped = false;
+  let eventWindows = 0;
+  let eventHits = 0;
+  let headBlock = 0;
   if (apiKey) {
     starkscanUsed = true;
-    const { candidates, pages, listed, hydrated, parsedHits, capped } = await scanStarkscan(
-      owner,
-      apiKey,
-      warnings,
-    );
+    const scanned = await scanStarkscan(owner, apiKey, warnings);
+    const { candidates, pages, listed, hydrated, parsedHits, capped } = scanned;
     starkscanPages = pages;
     starkscanListed = listed;
     starkscanHydrated = hydrated;
     starkscanParsed = parsedHits;
     starkscanCapped = !!capped;
+    eventWindows = scanned.eventWindows || 0;
+    eventHits = scanned.eventHits || 0;
+    headBlock = scanned.headBlock || 0;
 
     const toVerify = [...candidates.values()];
     await mapPool(toVerify, VERIFY_CONCURRENCY, async (c) => {
@@ -627,6 +779,9 @@ export async function scanApprovals(ownerRaw) {
       starkscanHydrated,
       starkscanParsed,
       starkscanCapped,
+      eventWindows,
+      eventHits,
+      headBlock,
       warnings,
     },
   };

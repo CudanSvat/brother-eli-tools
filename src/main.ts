@@ -168,9 +168,10 @@ function renderList() {
     return;
   }
   if (!state.approvals.length) {
-    box.innerHTML = `<div class="empty"><b>Clean</b><span>No live allowances found on the curated set${
-      state.warnings.some((w) => /STARKSCAN/i.test(w)) ? " (add STARKSCAN_API_KEY for a deeper history scan)" : ""
-    }.</span></div>`;
+    const hint = state.warnings[0]
+      ? esc(state.warnings[0])
+      : "No live allowances after curated check + Starkscan history. If that feels wrong, hit Rescan or tell us — nested swap approvals need the latest scanner.";
+    box.innerHTML = `<div class="empty"><b>Clean</b><span>${hint}</span></div>`;
     return;
   }
 
@@ -311,11 +312,15 @@ async function onScan() {
     state.warnings = res.meta.warnings || [];
     state.phase = "ready";
     renderAll();
+    const meta = res.meta || {};
+    const scanBits = meta.starkscanUsed
+      ? ` · Starkscan ${meta.starkscanHydrated ?? "?"} txs`
+      : " · curated only";
     const warn = state.warnings[0] ? ` · ${esc(state.warnings[0])}` : "";
     setStatus(
       state.approvals.length
-        ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"}.${warn}`
-        : `No live approvals on this pass.${warn}`,
+        ? `Found ${state.approvals.length} live approval${state.approvals.length === 1 ? "" : "s"}${scanBits}.${warn}`
+        : `No live approvals on this pass${scanBits}.${warn}`,
       state.approvals.length ? "ok" : "",
     );
   } catch (error) {

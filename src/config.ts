@@ -3,7 +3,7 @@
 export const SITE = "https://brothereli.com";
 
 export const RPC_URLS = [
-  "https://api.cartridge.gg/x/starknet/mainnet",
+  "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/demo",
   "https://cloud.argent-api.com/v1/starknet/mainnet/rpc/v0.8",
 ] as const;
 

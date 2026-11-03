@@ -20,6 +20,8 @@ export type ApprovalsResponse = {
     curatedChecked: number;
     starkscanUsed: boolean;
     starkscanPages: number;
+    starkscanHydrated?: number;
+    starkscanParsed?: number;
     warnings: string[];
   };
 };

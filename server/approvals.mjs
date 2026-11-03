@@ -1,13 +1,44 @@
 /**
  * Approvals discovery for Brother Eli Revoke.
- * Curated token×spender matrix + optional Starkscan history, then live RPC verify.
+ * Curated token×spender matrix + Starkscan history, then live RPC verify.
+ *
+ * Starkscan accountCalls are { to, selector, calldataLen } only — no calldata.
+ * We decode the tx calldata blob and/or Approval / ApprovalForAll logs.
  */
+import { hash } from "starknet";
 import { CURATED_SPENDERS, CURATED_TOKENS, normalizeAddress, spenderName, tokenMeta } from "./tokens.mjs";
 
 const STARKSCAN = "https://api.starkscan.co/v1/SN_MAIN";
-const MAX_TX_PAGES = 15;
+const MAX_TX_PAGES = 20;
 const PAGE_LIMIT = 100;
-const APPROVE_METHODS = new Set([
+const MAX_HYDRATE = 120;
+
+const SELECTOR = {
+  approve: hash.getSelectorFromName("approve"),
+  increase_allowance: hash.getSelectorFromName("increase_allowance"),
+  increaseAllowance: hash.getSelectorFromName("increaseAllowance"),
+  decrease_allowance: hash.getSelectorFromName("decrease_allowance"),
+  decreaseAllowance: hash.getSelectorFromName("decreaseAllowance"),
+  set_approval_for_all: hash.getSelectorFromName("set_approval_for_all"),
+  setApprovalForAll: hash.getSelectorFromName("setApprovalForAll"),
+  Approval: hash.getSelectorFromName("Approval"),
+  ApprovalForAll: hash.getSelectorFromName("ApprovalForAll"),
+};
+
+const APPROVE_SELECTORS = new Set([
+  normFelt(SELECTOR.approve),
+  normFelt(SELECTOR.increase_allowance),
+  normFelt(SELECTOR.increaseAllowance),
+  normFelt(SELECTOR.decrease_allowance),
+  normFelt(SELECTOR.decreaseAllowance),
+]);
+
+const OPERATOR_SELECTORS = new Set([
+  normFelt(SELECTOR.set_approval_for_all),
+  normFelt(SELECTOR.setApprovalForAll),
+]);
+
+const APPROVE_METHOD_NAMES = new Set([
   "approve",
   "increase_allowance",
   "increaseallowance",
@@ -19,8 +50,15 @@ const APPROVE_METHODS = new Set([
 
 const rate = new Map();
 
+function normFelt(value) {
+  return normalizeAddress(String(value));
+}
+
 function rpcUrl() {
-  return process.env.STARKNET_RPC_URL || "https://api.cartridge.gg/x/starknet/mainnet";
+  return (
+    process.env.STARKNET_RPC_URL ||
+    "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/demo"
+  );
 }
 
 function clientKey(req) {
@@ -40,13 +78,6 @@ function rateLimit(req) {
   bucket.count += 1;
   rate.set(key, bucket);
   return bucket.count <= 30;
-}
-
-function readBody(req) {
-  return new Promise((resolve) => {
-    // GET only for now
-    resolve(null);
-  });
 }
 
 async function rpcCall(method, params) {
@@ -71,7 +102,6 @@ function parseU256(low, high) {
 }
 
 async function callByName(contractAddress, entrypoint, calldata) {
-  const { hash } = await import("starknet");
   const selector = hash.getSelectorFromName(entrypoint);
   const result = await rpcCall("starknet_call", [
     {
@@ -137,76 +167,93 @@ async function starkscanGet(path, apiKey) {
   return res.json();
 }
 
-function methodLooksLikeApprove(name) {
-  if (!name) return false;
-  return APPROVE_METHODS.has(String(name).toLowerCase());
+/** Decode Cairo account __execute__ calldata: [n, (to, selector, len, data...)×n] */
+function decodeNestedCalls(calldata) {
+  if (!Array.isArray(calldata) || calldata.length < 1) return null;
+  const data = calldata.map(feltToBigInt);
+  let i = 0;
+  const n = Number(data[i++]);
+  if (!Number.isFinite(n) || n < 0 || n > 64) return null;
+  const calls = [];
+  for (let c = 0; c < n; c++) {
+    if (i + 3 > data.length) return null;
+    const to = data[i++];
+    const selector = data[i++];
+    const len = Number(data[i++]);
+    if (!Number.isFinite(len) || len < 0 || i + len > data.length) return null;
+    const cd = data.slice(i, i + len).map((v) => `0x${v.toString(16)}`);
+    i += len;
+    calls.push({
+      to: `0x${to.toString(16)}`,
+      selector: `0x${selector.toString(16)}`,
+      calldata: cd,
+    });
+  }
+  if (i !== data.length && i < data.length - 2) {
+    // leftover ok for some account wrappers; still return what we parsed if we got calls
+  }
+  return calls.length ? calls : null;
 }
 
-function extractCallsFromTx(detail) {
+/**
+ * Legacy offset format:
+ * [n, (to, selector, data_offset, data_len)×n, total_len, ...blob]
+ */
+function decodeOffsetCalls(calldata) {
+  if (!Array.isArray(calldata) || calldata.length < 1) return null;
+  const data = calldata.map(feltToBigInt);
+  let i = 0;
+  const n = Number(data[i++]);
+  if (!Number.isFinite(n) || n < 1 || n > 64) return null;
+  if (i + n * 4 + 1 > data.length) return null;
+  const headers = [];
+  for (let c = 0; c < n; c++) {
+    headers.push({
+      to: data[i++],
+      selector: data[i++],
+      offset: Number(data[i++]),
+      len: Number(data[i++]),
+    });
+  }
+  const total = Number(data[i++]);
+  if (!Number.isFinite(total) || i + total > data.length) return null;
+  const blob = data.slice(i, i + total);
   const calls = [];
-  const bag =
-    detail?.calls ||
-    detail?.accountCalls ||
-    detail?.account_calls ||
-    detail?.execution?.calls ||
-    detail?.trace?.calls ||
-    [];
-
-  const walk = (nodes) => {
-    if (!Array.isArray(nodes)) return;
-    for (const n of nodes) {
-      const entry =
-        n.entrypoint || n.entry_point || n.entryPoint || n.method || n.selectorName || n.name;
-      const contract =
-        n.contractAddress || n.contract_address || n.to || n.address || n.contract;
-      const calldata = n.calldata || n.callData || n.inputs || [];
-      if (contract && entry) {
-        calls.push({
-          contract: String(contract),
-          entrypoint: String(entry),
-          calldata: Array.isArray(calldata) ? calldata.map(String) : [],
-        });
-      }
-      if (n.calls) walk(n.calls);
-      if (n.internalCalls) walk(n.internalCalls);
-      if (n.internal_calls) walk(n.internal_calls);
-    }
-  };
-  walk(bag);
-
-  // Flat primaryMethod fallback: some list rows only expose method + counterparty
-  if (!calls.length && detail?.primaryMethod && detail?.toAddress) {
+  for (const h of headers) {
+    if (!Number.isFinite(h.offset) || !Number.isFinite(h.len) || h.offset + h.len > blob.length) return null;
+    const cd = blob.slice(h.offset, h.offset + h.len).map((v) => `0x${v.toString(16)}`);
     calls.push({
-      contract: String(detail.toAddress),
-      entrypoint: String(detail.primaryMethod),
-      calldata: [],
+      to: `0x${h.to.toString(16)}`,
+      selector: `0x${h.selector.toString(16)}`,
+      calldata: cd,
     });
   }
   return calls;
 }
 
-function parseApproveCall(call) {
-  const name = call.entrypoint.toLowerCase();
-  const data = call.calldata.map((c) => (c.startsWith("0x") ? c : `0x${c}`));
-  if (name === "approve" || name === "increase_allowance" || name === "increaseallowance") {
+function parseApproveFromCall(to, selector, calldata) {
+  const sel = normFelt(selector);
+  const data = (calldata || []).map((c) => (String(c).startsWith("0x") ? String(c) : `0x${c}`));
+  if (APPROVE_SELECTORS.has(sel)) {
     if (data.length < 3) return null;
-    const spender = normalizeAddress(data[0]);
     const amount = parseU256(data[1], data[2]);
+    const isDecrease =
+      sel === normFelt(SELECTOR.decrease_allowance) || sel === normFelt(SELECTOR.decreaseAllowance);
     return {
-      token: normalizeAddress(call.contract),
-      spender,
+      token: normalizeAddress(to),
+      spender: normalizeAddress(data[0]),
       type: "erc20",
       amount,
-      revoked: amount === 0n && (name === "approve"),
+      // decrease alone doesn't mean zero; still keep as candidate and RPC-verify
+      revoked: !isDecrease && amount === 0n,
     };
   }
-  if (name === "set_approval_for_all" || name === "setapprovalforall") {
+  if (OPERATOR_SELECTORS.has(sel)) {
     if (data.length < 2) return null;
-    const operator = normalizeAddress(data[0]);
     const approved = feltToBigInt(data[1]) !== 0n;
     return {
-      token: normalizeAddress(call.contract),
-      spender: operator,
+      token: normalizeAddress(to),
+      spender: normalizeAddress(data[0]),
       type: "erc721_operator",
       amount: null,
       revoked: !approved,
@@ -215,11 +262,143 @@ function parseApproveCall(call) {
   return null;
 }
 
+function parseApproveFromLogs(logs, owner) {
+  const out = [];
+  if (!Array.isArray(logs)) return out;
+  const ownerN = normalizeAddress(owner);
+  for (const log of logs) {
+    const name = String(log.eventName || "").toLowerCase();
+    const topic0 = log.topic0 ? normFelt(log.topic0) : "";
+    const keys = Array.isArray(log.keys) ? log.keys : [];
+    const data = Array.isArray(log.data) ? log.data : [];
+    const isApproval =
+      name === "approval" || topic0 === normFelt(SELECTOR.Approval);
+    const isApprovalForAll =
+      name === "approvalforall" || topic0 === normFelt(SELECTOR.ApprovalForAll);
+
+    if (isApproval) {
+      // SNIP-13: keys [selector, owner, spender], data [low, high]
+      // Legacy: owner/spender may sit in data
+      let ownerFelt = log.topic1 || keys[1];
+      let spenderFelt = log.topic2 || keys[2];
+      let low = data[0];
+      let high = data[1];
+      if ((!ownerFelt || !spenderFelt) && data.length >= 4) {
+        ownerFelt = data[0];
+        spenderFelt = data[1];
+        low = data[2];
+        high = data[3];
+      }
+      if (!ownerFelt || !spenderFelt) continue;
+      if (normalizeAddress(ownerFelt) !== ownerN) continue;
+      const amount = parseU256(low ?? "0x0", high ?? "0x0");
+      out.push({
+        token: normalizeAddress(log.address),
+        spender: normalizeAddress(spenderFelt),
+        type: "erc20",
+        amount,
+        revoked: amount === 0n,
+      });
+    } else if (isApprovalForAll) {
+      let ownerFelt = log.topic1 || keys[1];
+      let operatorFelt = log.topic2 || keys[2];
+      let approvedFelt = data[0];
+      if ((!ownerFelt || !operatorFelt) && data.length >= 3) {
+        ownerFelt = data[0];
+        operatorFelt = data[1];
+        approvedFelt = data[2];
+      }
+      if (!ownerFelt || !operatorFelt) continue;
+      if (normalizeAddress(ownerFelt) !== ownerN) continue;
+      const approved = feltToBigInt(approvedFelt) !== 0n;
+      out.push({
+        token: normalizeAddress(log.address),
+        spender: normalizeAddress(operatorFelt),
+        type: "erc721_operator",
+        amount: null,
+        revoked: !approved,
+      });
+    }
+  }
+  return out;
+}
+
+function extractApproveCandidates(detail, owner) {
+  const found = [];
+
+  // 1) Logs (most reliable when decoded)
+  found.push(...parseApproveFromLogs(detail.logs, owner));
+
+  // 2) Decode full execute calldata
+  const decoded =
+    decodeNestedCalls(detail.calldata) || decodeOffsetCalls(detail.calldata) || [];
+  for (const call of decoded) {
+    const parsed = parseApproveFromCall(call.to, call.selector, call.calldata);
+    if (parsed) found.push(parsed);
+  }
+
+  // 3) If accountCalls name a approve selector but we still lack calldata,
+  //    keep a soft candidate with spender unknown — skip (can't verify without spender).
+  //    Instead: if accountCalls length matches and we failed decode, try pairing
+  //    accountCalls.to + selector with slices from flat calldata when lengths sum.
+  if (!decoded.length && Array.isArray(detail.accountCalls) && Array.isArray(detail.calldata)) {
+    const soft = trySliceFromAccountCalls(detail.accountCalls, detail.calldata);
+    for (const call of soft) {
+      const parsed = parseApproveFromCall(call.to, call.selector, call.calldata);
+      if (parsed) found.push(parsed);
+    }
+  }
+
+  return found;
+}
+
+/** Last-resort: walk accountCalls and take sequential tails from calldata by calldataLen. */
+function trySliceFromAccountCalls(accountCalls, calldata) {
+  // Prefer nested decode of the whole blob first — already tried.
+  // Here: find a suffix of calldata that concatenates each call's payload.
+  const lens = accountCalls.map((c) => Number(c.calldataLen || 0));
+  const total = lens.reduce((a, b) => a + b, 0);
+  if (total <= 0 || total > calldata.length) return [];
+  const start = calldata.length - total;
+  let offset = start;
+  const out = [];
+  for (let i = 0; i < accountCalls.length; i++) {
+    const len = lens[i];
+    out.push({
+      to: accountCalls[i].to,
+      selector: accountCalls[i].selector,
+      calldata: calldata.slice(offset, offset + len),
+    });
+    offset += len;
+  }
+  return out;
+}
+
+function shouldHydrateTx(row) {
+  const type = String(row.txType || row.tx_type || "").toUpperCase();
+  if (type && type !== "INVOKE") return false;
+  const status = String(row.executionStatus || row.execution_status || "").toUpperCase();
+  if (status && status !== "SUCCEEDED" && status !== "REVERTED" && status !== "SUCCESS") {
+    // still hydrate unknowns
+  }
+  if (status === "REVERTED") return false;
+
+  const method = String(row.primaryMethod || row.primary_method || "").toLowerCase();
+  if (APPROVE_METHOD_NAMES.has(method)) return true;
+  if (row.methodsDiffer || row.methods_differ) return true;
+  // Nested approve inside swaps: primaryMethod is often the swap name
+  const calls = row.callCount ?? row.call_count;
+  if (calls == null || calls >= 1) return true;
+  return true;
+}
+
 async function scanStarkscan(owner, apiKey, warnings) {
   const candidates = new Map();
   let cursor = null;
   let pages = 0;
-  const approveHashes = [];
+  const hashes = [];
+  let hydrated = 0;
+  let parsedHits = 0;
 
   try {
     while (pages < MAX_TX_PAGES) {
@@ -232,41 +411,43 @@ async function scanStarkscan(owner, apiKey, warnings) {
       );
       const items = page.items || page.data || [];
       for (const row of items) {
-        const method = row.primaryMethod || row.primary_method || "";
-        const differ = row.methodsDiffer || row.methods_differ;
-        if (methodLooksLikeApprove(method) || differ) {
-          if (row.txHash || row.tx_hash) approveHashes.push(row.txHash || row.tx_hash);
-        }
+        if (!shouldHydrateTx(row)) continue;
+        const h = row.txHash || row.tx_hash;
+        if (h) hashes.push(h);
       }
       cursor = page.nextCursor || page.next_cursor || null;
       if (!cursor || !items.length) break;
     }
   } catch (error) {
     warnings.push(`Starkscan list failed: ${error.message || error}`);
-    return { candidates, pages };
+    return { candidates, pages, hydrated, parsedHits };
   }
 
-  // Cap hydrations
-  const unique = [...new Set(approveHashes)].slice(0, 80);
-  for (const hash of unique) {
+  const unique = [...new Set(hashes)].slice(0, MAX_HYDRATE);
+  for (const txHash of unique) {
     try {
-      const detail = await starkscanGet(`/tx/${hash}`, apiKey);
-      for (const call of extractCallsFromTx(detail)) {
-        const parsed = parseApproveCall(call);
-        if (!parsed) continue;
+      const detail = await starkscanGet(`/tx/${txHash}`, apiKey);
+      hydrated += 1;
+      for (const parsed of extractApproveCandidates(detail, owner)) {
+        parsedHits += 1;
         const key = candidateKey(parsed.token, parsed.spender, parsed.type);
-        if (parsed.revoked) {
-          candidates.delete(key);
-        } else {
-          candidates.set(key, parsed);
-        }
+        if (parsed.revoked) candidates.delete(key);
+        else candidates.set(key, parsed);
       }
     } catch (error) {
-      warnings.push(`Tx hydrate failed for ${hash.slice(0, 10)}…`);
+      warnings.push(`Tx hydrate failed for ${String(txHash).slice(0, 12)}…`);
     }
   }
 
-  return { candidates, pages };
+  if (!unique.length) {
+    warnings.push("Starkscan returned no invoke txs to scan (empty history or filter).");
+  } else if (!parsedHits) {
+    warnings.push(
+      `Scanned ${hydrated} txs but found no Approval/approve payloads — decode may need a tweak.`,
+    );
+  }
+
+  return { candidates, pages, hydrated, parsedHits };
 }
 
 /**
@@ -278,7 +459,6 @@ export async function scanApprovals(ownerRaw) {
   const apiKey = process.env.STARKSCAN_API_KEY || "";
   const map = new Map();
 
-  // 1) Curated matrix
   let curatedChecked = 0;
   for (const token of CURATED_TOKENS) {
     for (const spender of CURATED_SPENDERS) {
@@ -315,13 +495,16 @@ export async function scanApprovals(ownerRaw) {
     }
   }
 
-  // 2) Starkscan deepen
   let starkscanPages = 0;
   let starkscanUsed = false;
+  let starkscanHydrated = 0;
+  let starkscanParsed = 0;
   if (apiKey) {
     starkscanUsed = true;
-    const { candidates, pages } = await scanStarkscan(owner, apiKey, warnings);
+    const { candidates, pages, hydrated, parsedHits } = await scanStarkscan(owner, apiKey, warnings);
     starkscanPages = pages;
+    starkscanHydrated = hydrated;
+    starkscanParsed = parsedHits;
     for (const c of candidates.values()) {
       if (c.type === "erc20") {
         const amount = await readAllowance(c.token, owner, c.spender);
@@ -362,7 +545,7 @@ export async function scanApprovals(ownerRaw) {
       if (r.type !== "erc20") return 3;
       try {
         const v = BigInt(r.amount || "0");
-        if (v >= (1n << 255n)) return 2;
+        if (v >= 1n << 255n) return 2;
         return 1;
       } catch {
         return 0;
@@ -374,7 +557,14 @@ export async function scanApprovals(ownerRaw) {
   return {
     address: owner,
     approvals,
-    meta: { curatedChecked, starkscanUsed, starkscanPages, warnings },
+    meta: {
+      curatedChecked,
+      starkscanUsed,
+      starkscanPages,
+      starkscanHydrated,
+      starkscanParsed,
+      warnings,
+    },
   };
 }
 
@@ -391,7 +581,6 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
-/** Node http / Connect-style handler. */
 export async function handleApprovalsRequest(req, res) {
   if (req.method === "OPTIONS") {
     res.statusCode = 204;
@@ -421,7 +610,6 @@ export async function handleApprovalsRequest(req, res) {
   }
 
   try {
-    await readBody(req);
     const result = await scanApprovals(address);
     sendJson(res, 200, result);
   } catch (error) {

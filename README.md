@@ -37,7 +37,7 @@ Open `http://localhost:5175/tools/revoke/` (hub is available via `npm start` aft
 1. Deploy this repo (root = repo root).
 2. Variables:
    - `STARKSCAN_API_KEY` — optional now; paste when you have it
-   - `STARKNET_RPC_URL` — optional (defaults to Cartridge mainnet RPC)
+   - `STARKNET_RPC_URL` — Alchemy Starknet mainnet URL (your API key in the path)
 3. Generate a Railway domain, then point `brothereli.com/tools` (and `/tools/*`) at this service (Cloudflare path rule or proxy from the main Brother Eli site).
 
 ```bash

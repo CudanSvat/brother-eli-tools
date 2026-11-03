@@ -6,13 +6,22 @@
  * Then live RPC verify.
  */
 import { hash } from "starknet";
-import { CURATED_SPENDERS, CURATED_TOKENS, normalizeAddress, spenderName, tokenMeta } from "./tokens.mjs";
+import {
+  CURATED_SPENDERS,
+  getTokenUniverse,
+  normalizeAddress,
+  spenderName,
+  tokenMeta,
+} from "./tokens.mjs";
 
 const STARKSCAN = "https://api.starkscan.co/v1/SN_MAIN";
 /** Inclusive window size for positional event search (Starkscan free-tier max). */
 const EVENT_BLOCK_SPAN = 10_000;
-const EVENT_WINDOW_CONCURRENCY = 8;
+/** Keep concurrency low — free Starkscan keys 429 hard above ~1–2 heavy req/s. */
+const EVENT_WINDOW_CONCURRENCY = 2;
 const EVENT_PAGE_LIMIT = 100;
+/** If first-event probe fails, only walk this many recent blocks (not genesis). */
+const EVENT_FALLBACK_LOOKBACK = 400_000;
 const VERIFY_CONCURRENCY = 16;
 const CACHE_TTL_MS = 5 * 60_000;
 /** In-memory full-scan cache (address → result). */
@@ -157,7 +166,7 @@ function candidateKey(token, spender, type) {
   return `${normalizeAddress(token)}|${normalizeAddress(spender)}|${type}`;
 }
 
-async function starkscanGet(path, apiKey) {
+async function starkscanGet(path, apiKey, attempt = 0) {
   const res = await fetch(`${STARKSCAN}${path}`, {
     headers: {
       Accept: "application/json",
@@ -165,6 +174,11 @@ async function starkscanGet(path, apiKey) {
       "User-Agent": "BrotherEliRevoke/0.1",
     },
   });
+  if ((res.status === 429 || res.status === 503) && attempt < 4) {
+    const wait = 400 * 2 ** attempt + Math.floor(Math.random() * 200);
+    await new Promise((r) => setTimeout(r, wait));
+    return starkscanGet(path, apiKey, attempt + 1);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Starkscan ${res.status}: ${text.slice(0, 180)}`);
@@ -554,10 +568,11 @@ async function scanApprovalEvents(owner, apiKey, warnings) {
     }
     startFrom = firstIdx * EVENT_BLOCK_SPAN;
   } catch (error) {
+    // Never fall back to genesis on free tier — 17M blocks × windows = instant 429 storm.
+    startFrom = Math.max(0, head - EVENT_FALLBACK_LOOKBACK);
     warnings.push(
-      `First-event probe failed, scanning from genesis: ${String(error.message || error).slice(0, 100)}`,
+      `Event probe failed (${String(error.message || error).slice(0, 80)}). Scanning last ~${EVENT_FALLBACK_LOOKBACK} blocks only.`,
     );
-    startFrom = 0;
   }
 
   const windows = [];
@@ -642,12 +657,15 @@ function sortApprovals(list) {
   });
 }
 
-async function runCuratedMatrix(owner, map) {
+async function runCuratedMatrix(owner, map, apiKey) {
+  const tokens = await getTokenUniverse(owner, apiKey);
   const pairs = [];
-  for (const token of CURATED_TOKENS) {
+  for (const token of tokens) {
     for (const spender of CURATED_SPENDERS) pairs.push({ token, spender });
   }
-  await mapPool(pairs, VERIFY_CONCURRENCY, async ({ token, spender }) => {
+  // Cap pair fanout so AVNU list × routers stays responsive
+  const capped = pairs.length > 2500 ? pairs.slice(0, 2500) : pairs;
+  await mapPool(capped, VERIFY_CONCURRENCY, async ({ token, spender }) => {
     if (token.kind === "erc20") {
       const amount = await readAllowance(token.address, owner, spender.address);
       if (amount > 0n) {
@@ -678,7 +696,7 @@ async function runCuratedMatrix(owner, map) {
       }
     }
   });
-  return pairs.length;
+  return { checked: capped.length, tokenCount: tokens.length, spenderCount: CURATED_SPENDERS.length };
 }
 
 /**
@@ -699,7 +717,8 @@ export async function scanApprovals(ownerRaw, opts = {}) {
     }
   }
 
-  const curatedChecked = await runCuratedMatrix(owner, map);
+  const curated = await runCuratedMatrix(owner, map, apiKey);
+  const curatedChecked = curated.checked;
 
   let starkscanUsed = false;
   let eventWindows = 0;
@@ -750,7 +769,9 @@ export async function scanApprovals(ownerRaw, opts = {}) {
   } else if (mode === "full" && !apiKey) {
     warnings.push("No STARKSCAN_API_KEY — curated routers only.");
   } else if (mode === "quick") {
-    warnings.push("Quick scan (known tokens × routers). Deep history runs next…");
+    warnings.push(
+      `Quick: ${curated.tokenCount} tokens × ${curated.spenderCount} known routers (AVNU list + your transfers). Deep history next…`,
+    );
   }
 
   const result = {
@@ -759,6 +780,8 @@ export async function scanApprovals(ownerRaw, opts = {}) {
     meta: {
       mode,
       curatedChecked,
+      tokenCount: curated.tokenCount,
+      spenderCount: curated.spenderCount,
       starkscanUsed,
       starkscanPages: 0,
       starkscanListed: 0,

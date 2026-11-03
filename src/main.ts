@@ -308,7 +308,7 @@ function applyScanResult(res: Awaited<ReturnType<typeof fetchApprovals>>, deep: 
     ? meta.cached
       ? " · cached full history"
       : ` · full history: ${meta.eventWindows ?? "?"} windows, ${meta.eventHits ?? "?"} events (to block ${meta.headBlock ?? "?"})`
-    : " · quick (known routers)";
+    : " · quick (token list × routers)";
   const warn = state.warnings[0] && deep ? ` · ${esc(state.warnings[0])}` : "";
   setStatus(
     state.approvals.length

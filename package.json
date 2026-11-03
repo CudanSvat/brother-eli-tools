@@ -1,0 +1,26 @@
+{
+  "name": "brother-eli-tools",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Brother Eli Tools — SLAY utilities for Starknet (revoke first; more later)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node start.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@starknet-io/get-starknet": "^4.0.7",
+    "dotenv": "^17.2.1",
+    "starknet": "^6.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vite": "^6.0.0"
+  }
+}

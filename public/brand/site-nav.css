@@ -1,0 +1,177 @@
+/* Brother Eli masthead — same strip as brothereli.com, for /tools pages. */
+
+.site-nav {
+  --sn-display: "Eli Masthead Display", Impact, "Arial Narrow", sans-serif;
+  --sn-assets: https://brothereli.com/assets/believe;
+  position: relative;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: clamp(10px, 1.4vw, 18px);
+  box-sizing: border-box;
+  width: min(100vw, 1232px);
+  padding-inline: clamp(12px, 2vw, 28px);
+  height: clamp(56px, 5.6vw, 68px);
+  flex-shrink: 0;
+  margin: 12px 0 10px;
+  isolation: isolate;
+  overflow: visible;
+  z-index: 30;
+}
+
+.site-nav .sn-frame {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  container-type: inline-size;
+}
+.site-nav .sn-frame > picture {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  display: block;
+  width: 100%;
+}
+.site-nav .sn-frame > picture > img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.site-nav .sn-brand {
+  position: absolute;
+  top: 50%;
+  left: 10%;
+  width: 18.5%;
+  height: 44px;
+  transform: translateY(-50%);
+  touch-action: manipulation;
+}
+.site-nav .sn-brand:focus-visible {
+  outline: 2px dashed #181710;
+  outline-offset: 2px;
+}
+
+.site-nav .sn-frame nav {
+  position: absolute;
+  top: 50%;
+  left: 33%;
+  right: 5%;
+  height: 44px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: space-evenly;
+}
+
+.site-nav .sn-link {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  height: 44px;
+  padding: 0 .35em;
+  color: #050505 !important;
+  background: transparent !important;
+  font: 400 2.45cqw/1 var(--sn-display) !important;
+  letter-spacing: .01em !important;
+  text-decoration: none !important;
+  text-transform: uppercase;
+  white-space: nowrap;
+  touch-action: manipulation;
+  transition: transform 140ms ease;
+}
+.site-nav .sn-link::after {
+  content: "";
+  position: absolute;
+  left: .3em;
+  right: .3em;
+  top: calc(50% + .42em);
+  height: .28em;
+  background: url("https://brothereli.com/assets/believe/memes/art/ref-title-stroke-320.webp") center / 100% 100% no-repeat;
+  transform: rotate(-1deg);
+  pointer-events: none;
+}
+.site-nav .sn-link:hover { transform: translateY(-1px); }
+.site-nav .sn-link:focus-visible { outline: 2px dashed #181710; outline-offset: 2px; }
+.site-nav .sn-link[aria-current="page"] {
+  outline: 1.5px dashed #2a2620;
+  outline-offset: -5px;
+  box-shadow: inset 0 0 0 4px #f1e8d6, inset 0 0 0 5.5px #2a2620;
+}
+
+.site-nav .sn-cluster {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.site-nav .sn-buy {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: clamp(116px, 9.5vw, 134px);
+  height: 44px;
+  padding: 0 10px;
+  border: 0;
+  background: url("/tools/revoke/brand/textures/cta-1280.webp") center / 100% 100% no-repeat;
+  color: #050505 !important;
+  font: 400 23px/1 var(--sn-display) !important;
+  letter-spacing: .01em;
+  text-decoration: none !important;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: transform 140ms ease;
+}
+.site-nav .sn-buy:hover { transform: translateY(-1px) rotate(-1deg); }
+.site-nav .sn-buy:focus-visible { outline: 2px dashed #e9c528; outline-offset: 3px; }
+
+@media (max-width: 899px) {
+  .site-nav {
+    flex-wrap: wrap;
+    justify-content: center;
+    height: auto;
+    row-gap: 6px;
+    padding: 8px 8px 6px;
+    margin-bottom: 8px;
+  }
+  .site-nav .sn-frame {
+    flex: 0 0 min(100%, 348px);
+    height: 74px;
+    margin-inline: auto;
+  }
+  .site-nav .sn-brand { left: 28%; width: 44%; }
+  .site-nav .sn-frame nav {
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    transform: none;
+    justify-content: space-between;
+  }
+  .site-nav .sn-link {
+    padding: 0 3px;
+    font-size: clamp(11px, 3.9vw, 16px) !important;
+    color: #f1e8d6 !important;
+  }
+  .site-nav .sn-link::after { height: 5px; }
+  .site-nav .sn-link[aria-current="page"] {
+    outline-color: #f1e8d6;
+    box-shadow: none;
+    outline-offset: -4px;
+  }
+  .site-nav .sn-cluster {
+    flex: 0 0 min(100%, 348px);
+    justify-content: center;
+    margin: 50px auto 0;
+  }
+  .site-nav .sn-buy { width: 100px; font-size: 19px !important; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .site-nav .sn-link,
+  .site-nav .sn-buy { transition: none; }
+}

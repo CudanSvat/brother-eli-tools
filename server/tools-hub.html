@@ -10,6 +10,7 @@
     />
     <meta name="theme-color" content="#001b24" />
     <link rel="icon" type="image/svg+xml" href="/tools/revoke/favicon.svg" />
+    <link rel="stylesheet" href="/tools/revoke/brand/site-nav.css" />
     <link rel="preload" as="font" type="font/woff2" href="/tools/revoke/brand/fonts/eli-mint-press.woff2" crossorigin />
     <link rel="preload" as="font" type="font/woff2" href="/tools/revoke/brand/fonts/eli-caption-press-v2.woff2" crossorigin />
     <link rel="preload" as="font" type="font/woff2" href="/tools/revoke/brand/fonts/anton.woff2" crossorigin />
@@ -57,7 +58,7 @@
       .page {
         width: min(1100px, calc(100% - 28px));
         margin: 0 auto;
-        padding: 36px 0 70px;
+        padding: 12px 0 70px;
       }
 
       .sheet {
@@ -303,6 +304,26 @@
     </style>
   </head>
   <body>
+    <header class="site-nav" data-brand-masthead data-page="/tools/" data-has-action>
+      <div class="sn-frame">
+        <picture aria-hidden="true">
+          <source media="(max-width: 899px)" srcset="https://brothereli.com/assets/believe/shared-masthead-v5/shared-mobile-480.webp 480w, https://brothereli.com/assets/believe/shared-masthead-v5/shared-mobile-960.webp 960w, https://brothereli.com/assets/believe/shared-masthead-v5/shared-mobile-1440.webp 1440w" sizes="(max-width: 348px) calc(100vw - 16px), 332px" width="1240" height="264" />
+          <img src="https://brothereli.com/assets/believe/shared-masthead-v5/shared-desktop-1280.webp" srcset="https://brothereli.com/assets/believe/shared-masthead-v5/shared-desktop-1280.webp 1280w, https://brothereli.com/assets/believe/shared-masthead-v5/shared-desktop-2560.webp 2560w, https://brothereli.com/assets/believe/shared-masthead-v5/shared-desktop-4800.webp 4800w" sizes="(min-width: 1232px) 900px, calc(100vw - 340px)" width="1636" height="102" alt="" decoding="async" fetchpriority="high" draggable="false" />
+        </picture>
+        <a class="sn-brand" href="https://brothereli.com/" aria-label="Brother Eli home"></a>
+        <nav aria-label="Brother Eli pages" data-site-navigation data-page="/tools/">
+          <a class="sn-link" href="https://brothereli.com/memes" aria-label="MEMES">MEMES</a>
+          <a class="sn-link" href="https://brothereli.com/mint" aria-label="MINT AN ELI">MINT AN ELI</a>
+          <a class="sn-link" href="https://brothereli.com/marketplace" aria-label="MARKETPLACE">MARKETPLACE</a>
+          <a class="sn-link" href="https://brothereli.com/bridge" aria-label="BRIDGE">BRIDGE</a>
+          <a class="sn-link" href="https://brothereli.com/launchpad" aria-label="LAUNCHPAD">LAUNCHPAD</a>
+          <a class="sn-link" href="/tools/" aria-label="TOOLS" aria-current="page">TOOLS</a>
+        </nav>
+      </div>
+      <div class="sn-cluster">
+        <a class="sn-buy" href="https://brothereli.com/?buy=1" aria-label="Get SLAY">GET $SLAY</a>
+      </div>
+    </header>
     <main class="page">
       <section class="sheet" aria-labelledby="tools-title">
         <div class="hero">

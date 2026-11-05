@@ -1,7 +1,6 @@
-/* Brother Eli — move helper. Same materials as brothereli.com: night/teal
-   world, torn paper sheets, yellow tape actions, photo-print Eli frames,
-   Eli Mint Press / Eli Caption Press. No top chrome — the hero sheet is the
-   whole first composition. */
+/* Brother Eli tools. Same materials as brothereli.com: night/teal world,
+   torn paper sheets, yellow tape actions, photo-print Eli frames,
+   Eli Mint Press / Eli Caption Press. Site nav strip matches the main site. */
 
 @font-face { font-family: "Eli Mint Press"; src: url("/tools/revoke/brand/fonts/eli-mint-press.woff2") format("woff2"); font-weight: 400; font-display: swap; }
 @font-face { font-family: "Eli Caption Press"; src: url("/tools/revoke/brand/fonts/eli-caption-press-v2.woff2") format("woff2"); font-weight: 400; font-display: swap; }
@@ -81,7 +80,7 @@ code { font-family: var(--mono); font-size: .92em; padding: 0 .3em; background: 
 .page {
   width: min(1180px, calc(100% - 28px));
   margin: 0 auto;
-  padding: 36px 0 70px;
+  padding: 12px 0 70px;
 }
 
 /* Torn paper sheet: the marketplace hero material. */

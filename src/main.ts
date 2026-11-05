@@ -8,6 +8,7 @@ import {
   rowKey,
   summarizeCalls,
 } from "./revoke";
+import { siteNavHtml } from "./site-nav";
 import {
   ensureMainnet,
   forgetWallet,
@@ -41,8 +42,16 @@ const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 
+{
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = "/tools/revoke/brand/site-nav.css";
+  document.head.appendChild(link);
+}
+
 const root = $("#app");
 root.innerHTML = `
+  ${siteNavHtml("revoke")}
   <main class="page" id="revoke">
     <section class="sheet hero" id="hero">
       <div class="hero-copy">
@@ -69,10 +78,8 @@ root.innerHTML = `
     <footer class="foot">
       <p><b>Brother Eli Revoke.</b> This page only builds revoke calls (<code>approve</code> to zero / <code>set_approval_for_all</code> false) and hands them to your wallet to sign. It never sees keys and never transfers tokens. Clearing allowances does not disconnect dapp sessions inside Ready, Braavos, or other wallets — revoke those in the wallet too. Verify you are on <b>brothereli.com/tools/revoke</b>.</p>
       <p class="foot-links">
-        <a href="/tools/">Tools</a> ·
-        <a href="${SITE}" target="_blank" rel="noreferrer">brothereli.com</a> ·
-        <a href="${SITE}/mint" target="_blank" rel="noreferrer">Mint</a> ·
-        <a href="${SITE}/marketplace" target="_blank" rel="noreferrer">Marketplace</a>
+        <a href="/tools/">Tools hub</a> ·
+        <a href="${SITE}/">brothereli.com</a>
       </p>
     </footer>
   </main>
